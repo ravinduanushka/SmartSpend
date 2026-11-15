@@ -2,7 +2,15 @@ import { useState, useEffect } from 'react';
 import api from '../api/api';
 import { useAuth } from '../context/AuthContext';
 import Navbar from '../components/Navbar';
-import { ArrowDownCircle, ArrowUpCircle, DollarSign, PlusCircle, Trash2 } from 'lucide-react';
+import PayHereSandboxModal from '../components/PayHereSandboxModal';
+import {
+    ArrowDownCircle,
+    ArrowUpCircle,
+    CreditCard,
+    DollarSign,
+    PlusCircle,
+    Trash2,
+} from 'lucide-react';
 
 const DEFAULT_CATEGORIES = [
     { id: 1, name: 'Food & Dining', type: 'EXPENSE' },
@@ -12,6 +20,37 @@ const DEFAULT_CATEGORIES = [
     { id: 6, name: 'Entertainment', type: 'EXPENSE' },
 ];
 
+const PAYMENT_SERVICES = [
+    {
+        id: 'hotel',
+        label: 'Hotel Booking',
+        description: 'Pay hotel reservation & stay bills',
+        defaultAmount: '5000',
+        categoryKeywords: ['entertainment', 'hotel', 'travel', 'food'],
+    },
+    {
+        id: 'restaurant',
+        label: 'Restaurant',
+        description: 'Pay dining & food delivery bills',
+        defaultAmount: '1500',
+        categoryKeywords: ['food', 'dining', 'restaurant'],
+    },
+    {
+        id: 'utilities',
+        label: 'Utility Bills',
+        description: 'Electricity, water & internet bills',
+        defaultAmount: '2500',
+        categoryKeywords: ['utilities', 'utility', 'bill'],
+    },
+    {
+        id: 'transport',
+        label: 'Transport',
+        description: 'Cab rides, fuel & transit tickets',
+        defaultAmount: '800',
+        categoryKeywords: ['transport', 'travel', 'fuel'],
+    },
+];
+
 export default function Dashboard() {
     const { user } = useAuth();
     const [summary, setSummary] = useState({ totalIncome: 0, totalExpense: 0, netSavings: 0 });
@@ -19,7 +58,15 @@ export default function Dashboard() {
     const [categories, setCategories] = useState(DEFAULT_CATEGORIES);
     const [loading, setLoading] = useState(true);
     const [submitting, setSubmitting] = useState(false);
+    const [paying, setPaying] = useState(false);
     const [refreshKey, setRefreshKey] = useState(0);
+
+    const [selectedService, setSelectedService] = useState(null);
+    const [serviceAmount, setServiceAmount] = useState('');
+    const [serviceNote, setServiceNote] = useState('');
+
+    const [isPayModalOpen, setIsPayModalOpen] = useState(false);
+    const [paymentData, setPaymentData] = useState(null);
 
     const [formData, setFormData] = useState({
         amount: '',
@@ -71,12 +118,34 @@ export default function Dashboard() {
             }
         }
 
-        loadData();
+        void loadData();
 
         return () => {
             active = false;
         };
     }, [user?.userId, refreshKey]);
+
+    const handleSelectService = (service) => {
+        if (selectedService?.id === service.id) {
+            setSelectedService(null);
+            return;
+        }
+        setSelectedService(service);
+        setServiceAmount(service.defaultAmount);
+        setServiceNote('');
+    };
+
+    const resolveExpenseCategoryId = (service) => {
+        const expenseCategories = categories.filter((c) => c.type === 'EXPENSE');
+        if (service && expenseCategories.length > 0) {
+            const matched = expenseCategories.find((cat) =>
+                service.categoryKeywords.some((kw) => cat.name.toLowerCase().includes(kw))
+            );
+            if (matched) return matched.id;
+            return expenseCategories[0].id;
+        }
+        return 1;
+    };
 
     const handleCreateTransaction = async (e) => {
         e.preventDefault();
@@ -107,6 +176,75 @@ export default function Dashboard() {
         }
     };
 
+    const handleStartServicePayment = async () => {
+        if (!selectedService) return;
+        const parsedAmount = parseFloat(serviceAmount);
+        if (!parsedAmount || parsedAmount <= 0 || !user?.userId) {
+            alert('Please enter a valid payment amount.');
+            return;
+        }
+
+        setPaying(true);
+        try {
+            const orderId = `PAY_${selectedService.id.toUpperCase()}_${Date.now()}`;
+
+            const hashRes = await api.post('/payment/generate-hash', {
+                orderId: orderId,
+                amount: parsedAmount,
+                currency: 'LKR',
+            });
+
+            setPaymentData(hashRes.data);
+            setIsPayModalOpen(true);
+        } catch (err) {
+            console.error('PayHere hash generation failed:', err);
+            alert('Failed to initialize payment gateway.');
+        } finally {
+            setPaying(false);
+        }
+    };
+
+    const handleSimulatedPaymentSuccess = async (completedOrderId) => {
+        try {
+            const parsedAmount = parseFloat(paymentData.amount);
+
+            await api.post('/payment/notify', null, {
+                params: {
+                    merchant_id: paymentData.merchantId,
+                    order_id: completedOrderId,
+                    payhere_amount: paymentData.amount,
+                    payhere_currency: paymentData.currency,
+                    status_code: '2',
+                    md5sig: paymentData.hash,
+                },
+            });
+
+            const expenseCategoryId = resolveExpenseCategoryId(selectedService);
+            const label = selectedService ? selectedService.label : 'Service Payment';
+            const finalDescription = serviceNote.trim()
+                ? `${label}: ${serviceNote.trim()} (PayHere)`
+                : `${label} Payment (PayHere)`;
+
+            await api.post('/transactions', {
+                userId: user.userId,
+                categoryId: expenseCategoryId,
+                amount: parsedAmount,
+                description: finalDescription,
+                transactionDate: new Date().toISOString().split('T')[0],
+            });
+
+            setIsPayModalOpen(false);
+            setPaymentData(null);
+            setSelectedService(null);
+            setServiceAmount('');
+            setServiceNote('');
+            setRefreshKey((k) => k + 1);
+        } catch (err) {
+            console.error('Failed to record PayHere expense:', err);
+            alert('Payment succeeded, but failed to save transaction record.');
+        }
+    };
+
     const handleDelete = async (id) => {
         if (!user?.userId) return;
         if (window.confirm('Delete this transaction?')) {
@@ -125,6 +263,99 @@ export default function Dashboard() {
             <Navbar />
 
             <main className="max-w-6xl mx-auto px-4 py-8 space-y-8">
+                {/* Quick Services & Bill Payments */}
+                <div className="bg-slate-900 border border-slate-800 p-6 rounded-xl shadow-lg space-y-5">
+                    <div>
+                        <h2 className="text-base font-bold text-white flex items-center gap-2">
+                            <CreditCard className="h-5 w-5 text-sky-400" />
+                            <span>Pay Bills & Services</span>
+                        </h2>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                            Select a service below to pay directly via PayHere and automatically record the expense.
+                        </p>
+                    </div>
+
+                    {/* Service Selection Grid */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3.5">
+                        {PAYMENT_SERVICES.map((service) => {
+                            const isSelected = selectedService?.id === service.id;
+                            return (
+                                <button
+                                    key={service.id}
+                                    type="button"
+                                    onClick={() => handleSelectService(service)}
+                                    className={`text-left p-4 rounded-xl border transition cursor-pointer flex flex-col justify-between gap-2 ${
+                                        isSelected
+                                            ? 'bg-sky-950/50 border-sky-500 shadow-md shadow-sky-950/40'
+                                            : 'bg-slate-950/70 border-slate-800 hover:border-slate-700'
+                                    }`}
+                                >
+                                    <div className="flex items-center justify-between">
+                                        <p className="font-semibold text-sm text-white">{service.label}</p>
+                                        {isSelected && (
+                                            <span className="text-[10px] font-bold uppercase text-sky-400">Selected</span>
+                                        )}
+                                    </div>
+                                    <p className="text-xs text-slate-400">{service.description}</p>
+                                </button>
+                            );
+                        })}
+                    </div>
+
+                    {/* Revealed Payment Box when a Service is Clicked */}
+                    {selectedService && (
+                        <div className="bg-slate-950 border border-sky-800/60 rounded-xl p-4 flex flex-col md:flex-row md:items-end justify-between gap-4">
+                            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 flex-1">
+                                <div>
+                                    <label className="block text-xs font-medium text-slate-400 mb-1">
+                                        {selectedService.label} Amount (LKR)
+                                    </label>
+                                    <input
+                                        type="number"
+                                        min="100"
+                                        step="50"
+                                        value={serviceAmount}
+                                        onChange={(e) => setServiceAmount(e.target.value)}
+                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                                        placeholder="1500"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-xs font-medium text-slate-400 mb-1">
+                                        Merchant / Note (Optional)
+                                    </label>
+                                    <input
+                                        type="text"
+                                        value={serviceNote}
+                                        onChange={(e) => setServiceNote(e.target.value)}
+                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3.5 py-2 text-sm text-white focus:outline-none focus:border-sky-500"
+                                        placeholder={`e.g., ${selectedService.label} bill`}
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="flex items-center gap-2.5">
+                                <button
+                                    type="button"
+                                    onClick={() => setSelectedService(null)}
+                                    className="px-4 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium transition cursor-pointer"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={handleStartServicePayment}
+                                    disabled={paying}
+                                    className="bg-sky-600 hover:bg-sky-500 text-white text-sm font-semibold px-5 py-2 rounded-lg transition disabled:opacity-50 cursor-pointer shadow flex items-center gap-2"
+                                >
+                                    <CreditCard className="h-4 w-4" />
+                                    <span>{paying ? 'Initializing...' : `Pay Rs. ${Number(serviceAmount || 0).toLocaleString()} with PayHere`}</span>
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
                 {/* Metric Cards */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
                     <div className="bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg">
@@ -253,13 +484,13 @@ export default function Dashboard() {
                                             </p>
                                         </div>
                                         <div className="flex items-center space-x-3">
-                      <span
-                          className={`text-sm font-bold ${
-                              t.categoryType === 'INCOME' ? 'text-emerald-400' : 'text-rose-400'
-                          }`}
-                      >
-                        {t.categoryType === 'INCOME' ? '+' : '-'} Rs. {Number(t.amount).toLocaleString()}
-                      </span>
+                                            <span
+                                                className={`text-sm font-bold ${
+                                                    t.categoryType === 'INCOME' ? 'text-emerald-400' : 'text-rose-400'
+                                                }`}
+                                            >
+                                                {t.categoryType === 'INCOME' ? '+' : '-'} Rs. {Number(t.amount).toLocaleString()}
+                                            </span>
                                             <button
                                                 onClick={() => handleDelete(t.id)}
                                                 className="text-slate-500 hover:text-rose-400 transition cursor-pointer p-1"
@@ -275,6 +506,13 @@ export default function Dashboard() {
                     </div>
                 </div>
             </main>
+
+            <PayHereSandboxModal
+                isOpen={isPayModalOpen}
+                onClose={() => setIsPayModalOpen(false)}
+                paymentData={paymentData}
+                onPaymentSuccess={handleSimulatedPaymentSuccess}
+            />
         </div>
     );
 }
